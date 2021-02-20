@@ -14,13 +14,18 @@
 #define VFS_INODESIZE 256
 #define VFS_SIZE VFS_BLOCKS*VFS_BLOCKSIZE
 
+#define INODE_BITMAP_OFFSET 1
+#define DATA_BITMAP_OFFSET 2
+#define INODE_ARRAY_OFFSET 3
+#define DATA_OFFSET 8
+
 typedef struct Superblock {
-    int n_free_data_blocks;
-    int n_free_inode_blocks;
-    int inode_bitmap_offset;
-    int data_bitmap_offset;
-    int inode_array_offset;
-    int data_offset;
+    int n_free_data_blocks;     /* Number of free data blocks */
+    int n_free_inode_blocks;    /* Number of free iNode blocks */
+    int inode_bitmap_offset;    /* Offset to iNode blocks bitmap */
+    int data_bitmap_offset;     /* Offset to data blocks bitmap */
+    int inode_array_offset;     /* Offset to array of iNodes */
+    int data_offset;            /* Offset to data blocks */
 } Superblock;
 
 typedef struct inodeBitmap
@@ -40,6 +45,34 @@ typedef struct iNode
     char name[128];
 } iNode;
 
+
+void read_vfs(Superblock *superblck, inodeBitmap *inodeBitmap, dataBitmap *dataBitmap, FILE* vfs)
+{
+    /* Read Superblock */
+    fread(superblck, sizeof(Superblock), 1, vfs);
+
+    /* Read iNode bitmap */
+    fseek(vfs, superblck->inode_bitmap_offset*VFS_BLOCKSIZE, SEEK_SET);
+    fread(inodeBitmap, sizeof(*inodeBitmap), 1, vfs);
+
+    /* Read data blocks bitmap */
+    fseek(vfs, superblck->data_bitmap_offset*VFS_BLOCKSIZE, SEEK_SET);
+    fread(dataBitmap, sizeof(*dataBitmap), 1, vfs);
+}
+
+void save_vfs(FILE* vfs, Superblock *superblck, inodeBitmap *inodeBitmap, dataBitmap *dataBitmap)
+{
+    /* Store bitmaps in vfs */
+    fseek(vfs, VFS_BLOCKSIZE*superblck->inode_bitmap_offset, SEEK_SET);
+    fwrite(inodeBitmap, sizeof(*inodeBitmap), 1, vfs);
+    fseek(vfs, VFS_BLOCKSIZE*superblck->data_bitmap_offset, SEEK_SET);
+    fwrite(dataBitmap, sizeof(*dataBitmap), 1, vfs);
+    /* Store Superblock in vfs */
+    fseek(vfs, 0, SEEK_SET);
+    fwrite(superblck, sizeof(*superblck), 1, vfs);
+}
+
+/* Creates file that will be virtual disk */
 int create_vfs()
 {
     FILE* fp;
@@ -74,10 +107,10 @@ int create_vfs()
 
     superblock.n_free_inode_blocks = VFS_INODES;
     superblock.n_free_data_blocks = VFS_DATABLOCKS;
-    superblock.inode_bitmap_offset = 1;
-    superblock.data_bitmap_offset = 2;
-    superblock.inode_array_offset = 3;
-    superblock.data_offset = 8;
+    superblock.inode_bitmap_offset = INODE_BITMAP_OFFSET;
+    superblock.data_bitmap_offset = DATA_BITMAP_OFFSET;
+    superblock.inode_array_offset = INODE_ARRAY_OFFSET;
+    superblock.data_offset = DATA_OFFSET;
 
     fp = fopen(VFS_NAME, "r+");
     if (!fp)
@@ -85,8 +118,6 @@ int create_vfs()
         printf("File system does not exist\n");
         return -1;
     }
-    /* Store Superblock in vfs */
-    fwrite(&superblock, sizeof(superblock), 1, fp);
 
     /* Store bitmaps in vfs */
     for (i = 0; i < VFS_INODES; i++)
@@ -98,10 +129,7 @@ int create_vfs()
         dataBitmap.occupied[i] = '\0';
     }
 
-    fseek(fp, VFS_BLOCKSIZE*1, SEEK_SET);
-    fwrite(&inodeBitmap, sizeof(inodeBitmap), 1, fp);
-    fseek(fp, VFS_BLOCKSIZE*2, SEEK_SET);
-    fwrite(&dataBitmap, sizeof(dataBitmap), 1, fp);
+    save_vfs(fp, &superblock, &inodeBitmap, &dataBitmap);
     fclose(fp);
 
 }
@@ -131,12 +159,12 @@ int get_needed_blocks(char* filename)
     size = st.st_size;
     needed_data_blocks = size / VFS_BLOCKSIZE + 1;
     return needed_data_blocks;
-    
 }
 
 int find_data_space(int needed_data_blocks, dataBitmap* dataBitmap)
 {
     int blocks_to_find, first, current;
+
     /* Find enough free data blocks */
     blocks_to_find = needed_data_blocks;
     first = 0;
@@ -180,6 +208,8 @@ void store_data_on_vfs(int first_block, char* filename, Superblock *superblock, 
     struct stat st;
     int i, count;
     char buf[VFS_BLOCKSIZE];
+    size_t read_elements;
+
     src = fopen(filename, "r");
     vfs = fopen(VFS_NAME, "r+");
     fseek(vfs, (superblock->data_offset+first_block)*VFS_BLOCKSIZE, SEEK_SET);
@@ -192,9 +222,9 @@ void store_data_on_vfs(int first_block, char* filename, Superblock *superblock, 
         {
             count = i;
         }
-        fread(buf, 1, count, src);
-        fwrite(buf, count, 1, vfs);
-        i -= count;
+        read_elements = fread(buf, 1, count, src);
+        fwrite(buf, read_elements, 1, vfs);
+        i -= read_elements;
     }
     
     fclose(src);
@@ -203,6 +233,7 @@ void store_data_on_vfs(int first_block, char* filename, Superblock *superblock, 
 
 }
 
+/* Check if file with given name already exists in vfs */
 int is_unique(inodeBitmap *inodeBitmap, Superblock *superblock, char* filename)
 {
     FILE *vfs;
@@ -227,6 +258,17 @@ int is_unique(inodeBitmap *inodeBitmap, Superblock *superblock, char* filename)
     return 0;
 }
 
+void store_inode(char* filename, struct stat st, iNode iNode, int data_space, FILE* vfs, Superblock superblck, int inode_space)
+{
+    /* Create and store iNode */
+    stat(filename, &st);
+    iNode.first_block = data_space;
+    iNode.size = st.st_size;
+    strcpy(iNode.name, filename);
+    fseek(vfs, (superblck.inode_array_offset*VFS_BLOCKSIZE) + (inode_space*VFS_INODESIZE), SEEK_SET);
+    fwrite(&iNode, sizeof(iNode), 1, vfs);
+}
+
 int copy_on_vfs(char* filename)
 {
     FILE *src, *vfs;
@@ -242,7 +284,7 @@ int copy_on_vfs(char* filename)
     src = fopen(filename, "r");
     if (!src)
     {
-        printf("File %s does not \n", filename);
+        printf("File %s does not exist\n", filename);
         return -1;
     }
 
@@ -254,8 +296,8 @@ int copy_on_vfs(char* filename)
         return -1;
     }
 
-    /* Read Superblock */
-    fread(&superblck, sizeof(Superblock), 1, vfs);
+    read_vfs(&superblck, &inodeBitmap, &dataBitmap, vfs);
+
     /* Check if vfs is not full */
     if (superblck.n_free_inode_blocks == 0)
     {
@@ -263,14 +305,6 @@ int copy_on_vfs(char* filename)
         return -1;
     }
     
-    /* Read iNode bitmap */
-    fseek(vfs, superblck.inode_bitmap_offset*VFS_BLOCKSIZE, SEEK_SET);
-    fread(&inodeBitmap, sizeof(inodeBitmap), 1, vfs);
-
-    /* Read data blocks bitmap */
-    fseek(vfs, superblck.data_bitmap_offset*VFS_BLOCKSIZE, SEEK_SET);
-    fread(&dataBitmap, sizeof(dataBitmap), 1, vfs);
-
     /* Check if file is unique */
     if (is_unique(&inodeBitmap, &superblck, filename) == -1)
     {
@@ -287,24 +321,15 @@ int copy_on_vfs(char* filename)
         printf("There is no enough size in file system\n");
         return -1;
     }
-
     
     /* Find space for data */
     data_space = find_data_space(needed_data_blocks, &dataBitmap);
     /* Find space for iNode */
     inode_space = find_inode_space(&inodeBitmap);
-
     /* Store data */
     store_data_on_vfs(data_space, filename, &superblck, size);
 
-
-    /* Create and store iNode */
-    stat(filename, &st);
-    iNode.first_block = data_space;
-    iNode.size = st.st_size;
-    strcpy(iNode.name, filename);
-    fseek(vfs, (superblck.inode_array_offset*VFS_BLOCKSIZE) + (inode_space*VFS_INODESIZE), SEEK_SET);
-    fwrite(&iNode, sizeof(iNode), 1, vfs);
+    store_inode(filename, st, iNode, data_space, vfs, superblck, inode_space);
 
     /* Update info in bitmaps */
     for (i = data_space; i < data_space + needed_data_blocks; i++)
@@ -312,22 +337,14 @@ int copy_on_vfs(char* filename)
         dataBitmap.occupied[i] = 1;
     }
     inodeBitmap.occupied[inode_space] = 1;
-    /* Store bitmaps in vfs */
-    fseek(vfs, VFS_BLOCKSIZE*superblck.inode_bitmap_offset, SEEK_SET);
-    fwrite(&inodeBitmap, sizeof(inodeBitmap), 1, vfs);
-    fseek(vfs, VFS_BLOCKSIZE*superblck.data_bitmap_offset, SEEK_SET);
-    fwrite(&dataBitmap, sizeof(dataBitmap), 1, vfs);
 
     /* Update info in Superblock */
     superblck.n_free_data_blocks -= needed_data_blocks;
     superblck.n_free_inode_blocks -= 1;
 
-    /* Store Superblock in vfs */
-    fseek(vfs, 0, SEEK_SET);
-    fwrite(&superblck, sizeof(superblck), 1, vfs);
+    save_vfs(vfs, &superblck, &inodeBitmap, &dataBitmap);
     fclose(vfs);
     fclose(src);
-
 }
 
 
@@ -337,6 +354,7 @@ void write_content_to_new_file(char* filename, iNode* iNodeptr, Superblock *supe
     int size, count;
     char buf[VFS_BLOCKSIZE];
     char* copyfilename;
+    size_t read_elements;
 
     copyfilename = malloc(strlen(filename) + strlen("copy_") + 1);
     strcpy(copyfilename, "copy_");
@@ -353,14 +371,13 @@ void write_content_to_new_file(char* filename, iNode* iNodeptr, Superblock *supe
         {
             count = size;
         }
-        fread(buf, 1, count, vfs);
-        fwrite(buf, count, 1, dest);
-        size -= count;
+        read_elements = fread(buf, 1, count, vfs);
+        fwrite(buf, read_elements, 1, dest);
+        size -= read_elements;
     }
     printf("File %s copied to file %s\n", filename, copyfilename);
     fclose(dest);
     fclose(vfs);
-
 }
 
 
@@ -368,16 +385,16 @@ int copy_from_vfs(char* filename)
 {
     FILE *vfs;
     Superblock superblck;
+    inodeBitmap inodeBitmap;
+    dataBitmap dataBitmap;
     iNode iNode;
     int iNode_found, i;
 
     vfs = fopen(VFS_NAME, "r+");
     
-    /* Read Superblock */
-    fread(&superblck, sizeof(Superblock), 1, vfs);
+    read_vfs(&superblck, &inodeBitmap, &dataBitmap, vfs);
     
     /* Get position of file in vfs */
-    
     iNode_found = 0;
     for (i = 0; i < (VFS_INODES - superblck.n_free_inode_blocks)*VFS_INODESIZE; i+= VFS_INODESIZE)
     {
@@ -401,6 +418,18 @@ int copy_from_vfs(char* filename)
     fclose(vfs);
 }
 
+void delete_inode(FILE* vfs, Superblock superblck, int position)
+{
+    int i;
+    char null_buf[VFS_INODESIZE];
+    /* Write nulls in place of iNode */
+    fseek(vfs, superblck.inode_array_offset*VFS_BLOCKSIZE + position, SEEK_SET);
+    for (i = 0; i < VFS_INODESIZE; i++)
+    {
+        null_buf[i] = '\0';
+    }
+    fwrite(null_buf, VFS_INODESIZE, 1, vfs);
+}
 
 int remove_from_vfs(char* filename)
 {
@@ -411,23 +440,12 @@ int remove_from_vfs(char* filename)
     dataBitmap dataBitmap;
     int iNode_found, inode_position, position, n_occupied_blocks, i;
     char* null_sign;
-    char null_buf[VFS_INODESIZE];
-
+    
     vfs = fopen(VFS_NAME, "r+");
     
-    /* Read Superblock */
-    fread(&superblck, sizeof(Superblock), 1, vfs);
-
-    /* Read iNode bitmap */
-    fseek(vfs, superblck.inode_bitmap_offset*VFS_BLOCKSIZE, SEEK_SET);
-    fread(&inodeBitmap, sizeof(inodeBitmap), 1, vfs);
-
-    /* Read data blocks bitmap */
-    fseek(vfs, superblck.data_bitmap_offset*VFS_BLOCKSIZE, SEEK_SET);
-    fread(&dataBitmap, sizeof(dataBitmap), 1, vfs);
+    read_vfs(&superblck, &inodeBitmap, &dataBitmap, vfs);
 
     /* Get position of file in vfs */
-    
     iNode_found = 0;
     position = 0;
 
@@ -451,13 +469,7 @@ int remove_from_vfs(char* filename)
         return -1;
     }
 
-    /* Write nulls in place of iNode */
-    fseek(vfs, superblck.inode_array_offset*VFS_BLOCKSIZE + position, SEEK_SET);
-    for (i = 0; i < VFS_INODESIZE; i++)
-    {
-        null_buf[i] = '\0';
-    }
-    fwrite(null_buf, VFS_INODESIZE, 1, vfs);
+    delete_inode(vfs, superblck, position);
     
     /* Update iNode bitmap */
     inodeBitmap.occupied[(int)position/VFS_INODESIZE] = 0;
@@ -469,22 +481,14 @@ int remove_from_vfs(char* filename)
         dataBitmap.occupied[i] = 0;
     }
 
-    /* Store bitmaps */
-    fseek(vfs, VFS_BLOCKSIZE*superblck.inode_bitmap_offset, SEEK_SET);
-    fwrite(&inodeBitmap, sizeof(inodeBitmap), 1, vfs);
-    fseek(vfs, VFS_BLOCKSIZE*superblck.data_bitmap_offset, SEEK_SET);
-    fwrite(&dataBitmap, sizeof(dataBitmap), 1, vfs);
-
     /* Update Superblock */
     superblck.n_free_data_blocks += n_occupied_blocks;
     superblck.n_free_inode_blocks += 1;
-    fseek(vfs, 0, SEEK_SET);
-    fwrite(&superblck, sizeof(superblck), 1, vfs);
+    save_vfs(vfs, &superblck, &inodeBitmap, &dataBitmap);
 
     printf("File %s removed from file system\n", filename);
     fclose(vfs);
     return 0;
-
 }
 
 void list_vfs()
@@ -492,6 +496,7 @@ void list_vfs()
     FILE *vfs;
     Superblock superblock;
     inodeBitmap inodeBitmap;
+    dataBitmap dataBitmap;
     iNode iNode;
     int index;
 
@@ -501,11 +506,7 @@ void list_vfs()
         printf("File system does not exist");
         return;
     }
-    fread(&superblock, sizeof(superblock), 1, vfs);
-
-    /* Read iNode bitmap */
-    fseek(vfs, superblock.inode_bitmap_offset*VFS_BLOCKSIZE, SEEK_SET);
-    fread(&inodeBitmap, sizeof(inodeBitmap), 1, vfs);
+    read_vfs(&superblock, &inodeBitmap, &dataBitmap, vfs);
 
     index = 0;
     printf("*************************************\n");
@@ -540,11 +541,8 @@ void map_vfs()
         return;
     }
 
-    fread(&superblock, sizeof(superblock), 1, vfs);
-    fseek(vfs, superblock.inode_bitmap_offset*VFS_BLOCKSIZE, SEEK_SET);
-    fread(&inodeBitmap, sizeof(inodeBitmap), 1, vfs);
-    fseek(vfs, superblock.data_bitmap_offset*VFS_BLOCKSIZE, SEEK_SET);
-    fread(&dataBitmap, sizeof(dataBitmap), 1, vfs);
+    read_vfs(&superblock, &inodeBitmap, &dataBitmap, vfs);
+
     printf("|Address:%d, Type:%s, Size:%d(%d BLOCKS)|\n", 0, "SUPERBLOCK", VFS_BLOCKSIZE, 1);
     printf("|Address:%d, Type:%s, Size:%d(%d BLOCKS)|\n", superblock.inode_bitmap_offset*VFS_BLOCKSIZE, "INODE BLOCKS BITMAP", VFS_BLOCKSIZE, 1);
     printf("|Address:%d, Type:%s, Size:%d(%d BLOCKS)|\n", superblock.data_bitmap_offset*VFS_BLOCKSIZE, "DATA BLOCKS BITMAP", VFS_BLOCKSIZE, 1);
@@ -553,7 +551,6 @@ void map_vfs()
     n_blocks = 0;
     for (i = 0; i <= VFS_DATABLOCKS; i++)
     {
-        
         if (i == 0)
         {
             current_state = dataBitmap.occupied[i];
@@ -631,7 +628,7 @@ int main()
     copy_on_vfs("pan-tadeusz3600B.txt");
     list_vfs();
     map_vfs();
-
+    
     remove_vfs();
     return 0;
 }
